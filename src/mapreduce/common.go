@@ -20,6 +20,10 @@ type DoJobArgs struct {
 	NumOtherPhase int // total number of jobs in other phase (map or reduce)
 }
 
+func (d *DoJobArgs) String() string {
+	return fmt.Sprintf("Op: %s File: %s JobNum: %d, NumPhase: %d", d.Operation, d.File, d.JobNumber, d.NumOtherPhase)
+}
+
 type DoJobReply struct {
 	OK bool
 }

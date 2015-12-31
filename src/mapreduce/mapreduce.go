@@ -64,6 +64,10 @@ type MapReduce struct {
 	Workers map[string]*WorkerInfo
 
 	// add any additional state here
+	jobs            []*JobInfo
+	jobsDoing       int
+	jobDispatchChan chan *JobInfo
+	jobFinishChan   chan *JobInfo
 }
 
 func InitMapReduce(nmap int, nreduce int,
@@ -78,6 +82,9 @@ func InitMapReduce(nmap int, nreduce int,
 	mr.DoneChannel = make(chan bool)
 
 	// initialize any additional state here
+	mr.Workers = make(map[string]*WorkerInfo)
+	mr.jobFinishChan = make(chan *JobInfo)
+	mr.jobDispatchChan = make(chan *JobInfo)
 	return mr
 }
 
@@ -373,7 +380,6 @@ func (mr *MapReduce) Run() {
 	mr.stats = mr.RunMaster()
 	mr.Merge()
 	mr.CleanupRegistration()
-
 	fmt.Printf("%s: MapReduce done\n", mr.MasterAddress)
 
 	mr.DoneChannel <- true
