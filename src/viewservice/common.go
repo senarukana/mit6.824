@@ -1,6 +1,7 @@
 package viewservice
 
 import "time"
+import "fmt"
 
 //
 // This is a non-replicated view service for a simple
@@ -37,6 +38,11 @@ type View struct {
 	Viewnum uint
 	Primary string
 	Backup  string
+}
+
+// for debugging
+func (v View) String() string {
+	return fmt.Sprintf("View %v, Primary: %s, Backup: %s", v.Viewnum, v.Primary, v.Backup)
 }
 
 // clients should send a Ping RPC this often,

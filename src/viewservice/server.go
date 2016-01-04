@@ -8,25 +8,57 @@ import "sync"
 import "fmt"
 import "os"
 import "sync/atomic"
+import "math/rand"
 
 type ViewServer struct {
-	mu       sync.Mutex
+	sync.Mutex
 	l        net.Listener
 	dead     int32 // for testing
 	rpccount int32 // for testing
 	me       string
 
-
 	// Your declarations here.
+	view         View
+	nextView     *View
+	waitedBackup string
+	needAcked    bool
+
+	serverStat map[string]bool
 }
 
 //
 // server Ping RPC handler.
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
+	vs.Lock()
+	defer vs.Unlock()
+	vs.serverStat[args.Me] = true
+	defer func() error {
+		reply.View = vs.view
+		return nil
+	}()
 
-	// Your code here.
+	// choose current server as primary
+	if vs.view.Primary == "" {
+		vs.view.Primary = args.Me
+		vs.view.Viewnum++
+		vs.needAcked = true
+		return nil
+	}
 
+	if vs.view.Primary == args.Me {
+		if vs.view.Viewnum == args.Viewnum {
+			vs.needAcked = false
+		} else if args.Viewnum == 0 { // server restart
+			if vs.view.Backup != "" { // promote backup server
+				vs.view.Primary = vs.view.Backup
+				vs.view.Backup = ""
+				vs.view.Viewnum++
+				vs.needAcked = true
+			}
+			// no backup, vs is hanged, need to wait for primary server recover ...
+		}
+	}
 	return nil
 }
 
@@ -35,20 +67,67 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
-	// Your code here.
-
+	vs.Lock()
+	defer vs.Unlock()
+	reply.View = vs.view
 	return nil
 }
 
-
-//
-// tick() is called once per PingInterval; it should notice
-// if servers have died or recovered, and change the view
-// accordingly.
-//
 func (vs *ViewServer) tick() {
+	vs.Lock()
+	defer vs.Unlock()
 
-	// Your code here.
+	// if current view hasn't yet been acked, we shouldn't change view
+	if vs.needAcked || vs.view.Primary == "" {
+		return
+	}
+	changed := false
+	var idleServers []string
+	for server, alive := range vs.serverStat {
+		if alive && server != vs.view.Primary && server != vs.view.Backup {
+			idleServers = append(idleServers, server)
+		}
+	}
+
+	isPrimaryCrash := !vs.serverStat[vs.view.Primary]
+	needChoseBackup := false
+	if vs.view.Backup == "" || !vs.serverStat[vs.view.Backup] {
+		needChoseBackup = true
+	}
+	// primary server crash
+	if isPrimaryCrash {
+		// has backup server, promote it
+		if !needChoseBackup {
+			vs.view.Primary = vs.view.Backup
+			vs.view.Backup = ""
+			changed = true
+			needChoseBackup = true
+		} else {
+			return // no backup server, vs is hanged, need to wait for primary server recover ...
+		}
+	}
+	// backup server
+	if needChoseBackup {
+		// randomly choose a backup from idle server
+		if len(idleServers) != 0 {
+			backupServer := idleServers[rand.Int()%len(idleServers)]
+			vs.view.Backup = backupServer
+			changed = true
+		} else if vs.view.Backup != "" {
+			vs.view.Backup = ""
+			changed = true
+		} else {
+			// backup server is empty but there is no idle server
+		}
+	}
+	for server := range vs.serverStat {
+		vs.serverStat[server] = false
+	}
+	if changed {
+		vs.needAcked = true
+		vs.view.Viewnum++
+	}
+	time.Sleep(time.Millisecond * 100)
 }
 
 //
@@ -77,7 +156,7 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
-
+	vs.serverStat = make(map[string]bool)
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
 	rpcs.Register(vs)
