@@ -8,7 +8,6 @@ import "sync"
 import "fmt"
 import "os"
 import "sync/atomic"
-import "math/rand"
 
 type ViewServer struct {
 	sync.Mutex
@@ -18,12 +17,14 @@ type ViewServer struct {
 	me       string
 
 	// Your declarations here.
-	view         View
-	nextView     *View
-	waitedBackup string
-	needAcked    bool
-
-	serverStat map[string]bool
+	view        View
+	needAcked   bool
+	curTick     int
+	primaryTick int
+	backupTick  int
+	// prevent no backup server situation
+	idleTick   int
+	idleServer string
 }
 
 //
@@ -32,8 +33,21 @@ type ViewServer struct {
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	vs.Lock()
 	defer vs.Unlock()
-	vs.serverStat[args.Me] = true
+	changed := false
+
 	defer func() error {
+		if changed {
+			vs.view.Viewnum++
+			vs.needAcked = true
+		}
+		if args.Me == vs.view.Primary {
+			vs.primaryTick = vs.curTick
+		} else if args.Me == vs.view.Backup {
+			vs.backupTick = vs.curTick
+		} else {
+			vs.idleTick = vs.curTick
+			vs.idleServer = args.Me
+		}
 		reply.View = vs.view
 		return nil
 	}()
@@ -49,16 +63,15 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	if vs.view.Primary == args.Me {
 		if vs.view.Viewnum == args.Viewnum {
 			vs.needAcked = false
-		} else if args.Viewnum == 0 { // server restart
-			if vs.view.Backup != "" { // promote backup server
-				vs.view.Primary = vs.view.Backup
-				vs.view.Backup = ""
-				vs.view.Viewnum++
-				vs.needAcked = true
-			}
-			// no backup, vs is hanged, need to wait for primary server recover ...
+		} else if args.Viewnum == 0 && vs.view.Backup != "" { // server restart, promote backup server
+			vs.view.Primary = vs.view.Backup
+			vs.view.Backup = ""
+			vs.primaryTick = vs.backupTick
+			changed = true
 		}
+		return nil
 	}
+
 	return nil
 }
 
@@ -73,61 +86,56 @@ func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 	return nil
 }
 
+func (vs *ViewServer) isPrimaryCrash() bool {
+	return vs.curTick-vs.primaryTick > DeadPings
+}
+
+func (vs *ViewServer) isBackupCrash() bool {
+	return vs.view.Backup != "" && vs.curTick-vs.backupTick > DeadPings
+}
+
+func (vs *ViewServer) hasIdleServer() bool {
+	return vs.curTick-vs.idleTick < DeadPings
+}
+
 func (vs *ViewServer) tick() {
 	vs.Lock()
 	defer vs.Unlock()
+	vs.curTick++
 
 	// if current view hasn't yet been acked, we shouldn't change view
 	if vs.needAcked || vs.view.Primary == "" {
 		return
 	}
 	changed := false
-	var idleServers []string
-	for server, alive := range vs.serverStat {
-		if alive && server != vs.view.Primary && server != vs.view.Backup {
-			idleServers = append(idleServers, server)
-		}
-	}
+	needPromoteBackup := vs.view.Backup == "" || vs.isBackupCrash()
 
-	isPrimaryCrash := !vs.serverStat[vs.view.Primary]
-	needChoseBackup := false
-	if vs.view.Backup == "" || !vs.serverStat[vs.view.Backup] {
-		needChoseBackup = true
-	}
 	// primary server crash
-	if isPrimaryCrash {
+	if vs.isPrimaryCrash() && vs.view.Backup != "" && !vs.isBackupCrash() {
 		// has backup server, promote it
-		if !needChoseBackup {
-			vs.view.Primary = vs.view.Backup
-			vs.view.Backup = ""
-			changed = true
-			needChoseBackup = true
-		} else {
-			return // no backup server, vs is hanged, need to wait for primary server recover ...
-		}
+		vs.primaryTick = vs.backupTick
+		vs.view.Primary = vs.view.Backup
+		vs.view.Backup = ""
+		changed = true
+		needPromoteBackup = true
 	}
 	// backup server
-	if needChoseBackup {
-		// randomly choose a backup from idle server
-		if len(idleServers) != 0 {
-			backupServer := idleServers[rand.Int()%len(idleServers)]
-			vs.view.Backup = backupServer
+	if needPromoteBackup {
+		if vs.hasIdleServer() {
+			vs.view.Backup = vs.idleServer
+			vs.backupTick = vs.idleTick
 			changed = true
+
 		} else if vs.view.Backup != "" {
 			vs.view.Backup = ""
 			changed = true
-		} else {
-			// backup server is empty but there is no idle server
+
 		}
-	}
-	for server := range vs.serverStat {
-		vs.serverStat[server] = false
 	}
 	if changed {
 		vs.needAcked = true
 		vs.view.Viewnum++
 	}
-	time.Sleep(time.Millisecond * 100)
 }
 
 //
@@ -156,7 +164,6 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
-	vs.serverStat = make(map[string]bool)
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
 	rpcs.Register(vs)
