@@ -2,17 +2,21 @@ package pbservice
 
 import "viewservice"
 import "fmt"
-import "io"
-import "net"
+
+// import "io"
+// import "net"
 import "testing"
 import "time"
 import "log"
 import "runtime"
+
 import "math/rand"
 import "os"
-import "sync"
+
+// import "sync"
 import "strconv"
-import "strings"
+
+// import "strings"
 import "sync/atomic"
 
 func check(ck *Clerk, key string, value string) {

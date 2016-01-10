@@ -4,13 +4,22 @@ import "viewservice"
 import "net/rpc"
 import "fmt"
 
+import "log"
+import "time"
+
 import "crypto/rand"
 import "math/big"
 
+const (
+	TICK_THRESHOLD = 2
+)
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	view          *viewservice.View
+	backupAddress string
+	tick          int
 }
 
 // this may come in handy.
@@ -25,10 +34,14 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
 	return ck
 }
 
+func MakeReplicationClerk(backupAddress string) *Clerk {
+	return &Clerk{
+		backupAddress: backupAddress,
+	}
+}
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -64,6 +77,21 @@ func call(srv string, rpcname string,
 	return false
 }
 
+func (ck *Clerk) getView() *viewservice.View {
+	ck.tick++
+	if ck.view == nil || ck.tick == TICK_THRESHOLD {
+		// keep trying to get view
+		for {
+			if view, ok := ck.vs.Get(); ok {
+				ck.view = &view
+				break
+			}
+		}
+		ck.tick = 0
+	}
+	return ck.view
+}
+
 //
 // fetch a key's value from the current primary;
 // if they key has never been set, return "".
@@ -71,19 +99,73 @@ func call(srv string, rpcname string,
 // primary replies with the value or the primary
 // says the key doesn't exist (has never been Put().
 //
+// slave will never call it
 func (ck *Clerk) Get(key string) string {
+	args := &GetArgs{}
+	args.Key = key
+	var reply GetReply
+	var ok bool
+	for !ok {
+		primaryAddress := ck.getView().Primary
+		// send an RPC request, wait for the reply.
+		ok = call(primaryAddress, "PBServer.Get", args, &reply)
+		if ok {
+			break
+		}
+		// log.Printf("get key: %s from primary %s error: %s", key, primaryAddress, reply.Err)
+		time.Sleep(time.Millisecond * 50)
+	}
 
-	// Your code here.
-
-	return "???"
+	return reply.Value
 }
 
 //
 // send a Put or Append RPC
 //
-func (ck *Clerk) PutAppend(key string, value string, op string) {
+func (ck *Clerk) PutAppend(key string, value string, op Operation) {
+	args := &PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Token:     nrand(),
+		Operation: op,
+	}
+	var ok bool
+	var address string
+	doneChan := make(chan bool)
+	callFunc := func(args *PutAppendArgs, reply *PutAppendReply) {
+		ok := call(address, "PBServer.PutAppend", args, reply)
+		doneChan <- ok
+	}
+	for !ok {
+		if ck.backupAddress != "" {
+			address = ck.backupAddress
+		} else {
+			address = ck.getView().Primary
+		}
+		var reply PutAppendReply
 
-	// Your code here.
+		// send an RPC request, wait for the reply.
+		tick := time.After(time.Second)
+		go callFunc(args, &reply)
+		select {
+		case <-tick:
+			log.Printf("[%s] PutAppend key [%s] timeout\n", address, key)
+			continue
+		case ok = <-doneChan:
+			if ok && reply.Err != "" {
+				ok = false
+			}
+		}
+		if ok {
+			return
+		}
+		log.Printf("put key: %s to server %s error: %s", key, address, reply.Err)
+		time.Sleep(time.Millisecond * 100)
+	}
+}
+
+func (ck *Clerk) Replicate(args *PutAppendArgs, reply *PutAppendReply) bool {
+	return call(ck.backupAddress, "PBServer.PutAppend", args, reply)
 }
 
 //
@@ -91,7 +173,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PUT_OPERATION)
 }
 
 //
@@ -99,5 +181,5 @@ func (ck *Clerk) Put(key string, value string) {
 // must keep trying until it succeeds.
 //
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, APPEND_OPERATION)
 }
