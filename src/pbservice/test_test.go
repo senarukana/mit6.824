@@ -3,8 +3,8 @@ package pbservice
 import "viewservice"
 import "fmt"
 
-// import "io"
-// import "net"
+import "io"
+import "net"
 import "testing"
 import "time"
 import "log"
@@ -13,10 +13,10 @@ import "runtime"
 import "math/rand"
 import "os"
 
-// import "sync"
+import "sync"
 import "strconv"
 
-// import "strings"
+import "strings"
 import "sync/atomic"
 
 func check(ck *Clerk, key string, value string) {
@@ -57,7 +57,6 @@ func TestBasicFail(t *testing.T) {
 	if vck.Primary() != s1.me {
 		t.Fatal("first primary never formed view")
 	}
-
 	ck.Put("111", "v1")
 	check(ck, "111", "v1")
 
@@ -140,6 +139,7 @@ func TestBasicFail(t *testing.T) {
 	}
 	v, _ = vck.Get()
 	if v.Primary != s2.me {
+		log.Printf("primary %s, backup %s\n", v.Primary, v.Backup)
 		t.Fatal("backup never switched to primary")
 	}
 
@@ -746,6 +746,7 @@ func TestRepeatedCrash(t *testing.T) {
 				time.Sleep(10 * time.Millisecond)
 			}
 			ok = true
+			log.Printf("Done %d\n", i)
 		}(xi)
 	}
 
@@ -856,7 +857,7 @@ func TestRepeatedCrashUnreliable(t *testing.T) {
 		go ff(i, cha[i])
 	}
 
-	time.Sleep(20 * time.Second)
+	time.Sleep(10 * time.Second)
 	atomic.StoreInt32(&done, 1)
 
 	fmt.Printf("  ... Appends done ... \n")

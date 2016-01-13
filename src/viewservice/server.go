@@ -10,7 +10,7 @@ import "os"
 import "sync/atomic"
 
 type ViewServer struct {
-	sync.Mutex
+	lock     sync.Mutex
 	l        net.Listener
 	dead     int32 // for testing
 	rpccount int32 // for testing
@@ -31,22 +31,20 @@ type ViewServer struct {
 // server Ping RPC handler.
 //
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
-	vs.Lock()
-	defer vs.Unlock()
-	changed := false
+	vs.lock.Lock()
+	defer vs.lock.Unlock()
 
 	defer func() error {
-		if changed {
-			vs.view.Viewnum++
-			vs.needAcked = true
-		}
 		if args.Me == vs.view.Primary {
 			vs.primaryTick = vs.curTick
+			// log.Printf("primary %s tick\n", args.Me)
 		} else if args.Me == vs.view.Backup {
 			vs.backupTick = vs.curTick
+			// log.Printf("backup %s tick, needacked %v\n", args.Me, vs.needAcked)
 		} else {
 			vs.idleTick = vs.curTick
 			vs.idleServer = args.Me
+			// log.Printf("idle %s tick\n", args.Me)
 		}
 		reply.View = vs.view
 		return nil
@@ -56,22 +54,22 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 	if vs.view.Primary == "" {
 		vs.view.Primary = args.Me
 		vs.view.Viewnum++
-		vs.needAcked = true
 		return nil
 	}
 
 	if vs.view.Primary == args.Me {
 		if vs.view.Viewnum == args.Viewnum {
 			vs.needAcked = false
-		} else if args.Viewnum == 0 && vs.view.Backup != "" { // server restart, promote backup server
+
+		} else if !vs.needAcked && args.Viewnum == 0 && vs.view.Backup != "" { // server restart, promote backup server
+			log.Printf("change primary to %s -> %s\n", vs.view.Primary, vs.view.Backup)
 			vs.view.Primary = vs.view.Backup
 			vs.view.Backup = ""
 			vs.primaryTick = vs.backupTick
-			changed = true
+			vs.view.Viewnum++
 		}
 		return nil
 	}
-
 	return nil
 }
 
@@ -80,8 +78,8 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
-	vs.Lock()
-	defer vs.Unlock()
+	vs.lock.Lock()
+	defer vs.lock.Unlock()
 	reply.View = vs.view
 	return nil
 }
@@ -91,7 +89,7 @@ func (vs *ViewServer) isPrimaryCrash() bool {
 }
 
 func (vs *ViewServer) isBackupCrash() bool {
-	return vs.view.Backup != "" && vs.curTick-vs.backupTick > DeadPings
+	return vs.view.Backup == "" || (vs.view.Backup != "" && vs.curTick-vs.backupTick > DeadPings)
 }
 
 func (vs *ViewServer) hasIdleServer() bool {
@@ -99,19 +97,19 @@ func (vs *ViewServer) hasIdleServer() bool {
 }
 
 func (vs *ViewServer) tick() {
-	vs.Lock()
-	defer vs.Unlock()
+	vs.lock.Lock()
+	defer vs.lock.Unlock()
 	vs.curTick++
 
-	// if current view hasn't yet been acked, we shouldn't change view
-	if vs.needAcked || vs.view.Primary == "" {
+	if vs.view.Primary == "" {
 		return
 	}
 	changed := false
-	needPromoteBackup := vs.view.Backup == "" || vs.isBackupCrash()
+	needPromoteBackup := vs.isBackupCrash()
 
 	// primary server crash
-	if vs.isPrimaryCrash() && vs.view.Backup != "" && !vs.isBackupCrash() {
+	if !vs.needAcked && vs.isPrimaryCrash() && !vs.isBackupCrash() {
+		log.Printf("change primary to %s -> %s\n", vs.view.Primary, vs.view.Backup)
 		// has backup server, promote it
 		vs.primaryTick = vs.backupTick
 		vs.view.Primary = vs.view.Backup
@@ -125,15 +123,14 @@ func (vs *ViewServer) tick() {
 			vs.view.Backup = vs.idleServer
 			vs.backupTick = vs.idleTick
 			changed = true
-
+			vs.needAcked = true
 		} else if vs.view.Backup != "" {
 			vs.view.Backup = ""
+			vs.backupTick = 0
 			changed = true
-
 		}
 	}
 	if changed {
-		vs.needAcked = true
 		vs.view.Viewnum++
 	}
 }

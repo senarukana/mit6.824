@@ -4,7 +4,6 @@ import "viewservice"
 import "net/rpc"
 import "fmt"
 
-import "log"
 import "time"
 
 import "crypto/rand"
@@ -17,9 +16,9 @@ const (
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
-	view          *viewservice.View
-	backupAddress string
-	tick          int
+	view           *viewservice.View
+	lastUpdateTime int64
+	identifier     int64
 }
 
 // this may come in handy.
@@ -34,12 +33,20 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
+	ck.identifier = nrand()
 	return ck
 }
 
-func MakeReplicationClerk(backupAddress string) *Clerk {
-	return &Clerk{
-		backupAddress: backupAddress,
+func retryRPCCall(srv string, rpcname string,
+	args interface{}, reply interface{}) {
+	var ok bool
+	for !ok {
+		ok = call(srv, rpcname, args, reply)
+		if !ok {
+			// log.Printf("call %s rpc [%s] error", srv, rpcname)
+			ok = false
+			time.Sleep(time.Second)
+		}
 	}
 }
 
@@ -56,6 +63,7 @@ func MakeReplicationClerk(backupAddress string) *Clerk {
 // you should assume that call() will return an
 // error after a while if the server is dead.
 // don't provide your own time-out mechanism.
+
 //
 // please use call() to send all RPCs, in client.go and server.go.
 // please don't change this function.
@@ -78,18 +86,23 @@ func call(srv string, rpcname string,
 }
 
 func (ck *Clerk) getView() *viewservice.View {
-	ck.tick++
-	if ck.view == nil || ck.tick == TICK_THRESHOLD {
+	now := time.Now().Unix()
+	if ck.view == nil || now-ck.lastUpdateTime >= TICK_THRESHOLD {
 		// keep trying to get view
 		for {
 			if view, ok := ck.vs.Get(); ok {
 				ck.view = &view
 				break
 			}
+			time.Sleep(time.Second)
 		}
-		ck.tick = 0
+		ck.lastUpdateTime = time.Now().Unix()
 	}
 	return ck.view
+}
+
+func timeoutCall() {
+
 }
 
 //
@@ -104,16 +117,16 @@ func (ck *Clerk) Get(key string) string {
 	args := &GetArgs{}
 	args.Key = key
 	var reply GetReply
-	var ok bool
-	for !ok {
-		primaryAddress := ck.getView().Primary
+
+	for {
+		address := ck.getView().Primary
 		// send an RPC request, wait for the reply.
-		ok = call(primaryAddress, "PBServer.Get", args, &reply)
-		if ok {
+		ok := call(address, "PBServer.Get", args, &reply)
+		if ok && reply.Err == "" {
 			break
 		}
-		// log.Printf("get key: %s from primary %s error: %s", key, primaryAddress, reply.Err)
-		time.Sleep(time.Millisecond * 50)
+		reply.Err = ""
+		time.Sleep(viewservice.PingInterval)
 	}
 
 	return reply.Value
@@ -124,48 +137,21 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op Operation) {
 	args := &PutAppendArgs{
-		Key:       key,
-		Value:     value,
-		Token:     nrand(),
-		Operation: op,
+		Key:              key,
+		Value:            value,
+		Token:            nrand(),
+		ClientIdentifier: ck.identifier,
+		Operation:        op,
 	}
-	var ok bool
-	var address string
-	doneChan := make(chan bool)
-	callFunc := func(args *PutAppendArgs, reply *PutAppendReply) {
-		ok := call(address, "PBServer.PutAppend", args, reply)
-		doneChan <- ok
-	}
-	for !ok {
-		if ck.backupAddress != "" {
-			address = ck.backupAddress
-		} else {
-			address = ck.getView().Primary
-		}
+	for {
 		var reply PutAppendReply
-
-		// send an RPC request, wait for the reply.
-		tick := time.After(time.Second)
-		go callFunc(args, &reply)
-		select {
-		case <-tick:
-			log.Printf("[%s] PutAppend key [%s] timeout\n", address, key)
-			continue
-		case ok = <-doneChan:
-			if ok && reply.Err != "" {
-				ok = false
-			}
-		}
-		if ok {
+		address := ck.getView().Primary
+		ok := call(address, "PBServer.PutAppend", args, &reply)
+		if ok && reply.Err == "" {
 			return
 		}
-		log.Printf("put key: %s to server %s error: %s", key, address, reply.Err)
-		time.Sleep(time.Millisecond * 100)
+		time.Sleep(viewservice.PingInterval)
 	}
-}
-
-func (ck *Clerk) Replicate(args *PutAppendArgs, reply *PutAppendReply) bool {
-	return call(ck.backupAddress, "PBServer.PutAppend", args, reply)
 }
 
 //

@@ -13,155 +13,166 @@ import "syscall"
 import "math/rand"
 
 type PBServer struct {
-	sync.Mutex
 	l          net.Listener
 	dead       int32 // for testing
 	unreliable int32 // for testing
 	me         string
 	vs         *viewservice.Clerk
 	// Your declarations here.
-	state       State
-	view        viewservice.View
-	requestChan chan *OperationArgs
-	data        map[string]*Value
 
-	// replication
-	replication    *Replication
-	replChan       chan *RepliOperationArgs
-	backupAddress  string
-	primaryAddress string
+	// state
+	state       int32
+	replicating int32
+	curTick     int64
+	lastTick    int64
+
+	// view
+	lock     sync.Mutex // protect view
+	view     *viewservice.View
+	lastView *viewservice.View
+
+	// data
+	writeCond *sync.Cond // protect data
+	data      map[string]*Value
 }
 
 type Value struct {
-	token int64
-	data  string
+	ClientHistory map[int64]int64
+	Data          string
 }
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
-	pb.Lock()
-	defer pb.Unlock()
-
-	if pb.state != PRIMARY {
-		reply.Err = Err(fmt.Sprintf("plz send get command to primary, my state is %v", pb.state))
+	if atomic.LoadInt32(&pb.state) != PRIMARY {
+		reply.Err = Err(fmt.Sprintf("plz send get command to primary, my state is %v", atomic.LoadInt32(&pb.state)))
 	} else {
+		pb.writeCond.L.Lock()
 		if _, ok := pb.data[args.Key]; ok {
-			reply.Value = pb.data[args.Key].data
+			reply.Value = pb.data[args.Key].Data
 		}
+		pb.writeCond.L.Unlock()
 	}
-
-	// resultChan := make(chan interface{})
-	// pb.requestChan <- &OperationArgs{
-	//	op:         GET_OPERATION,
-	//	args:       args,
-	//	resultChan: resultChan,
-	// }
-	// *reply = *((<-resultChan).(*GetReply))
 	return nil
 }
 
 func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	pb.Lock()
-	if pb.state == IDLE {
-		reply.Err = "plz send command to others, i'm a idle server"
+	if atomic.LoadInt32(&pb.state) == IDLE {
+		reply.Err = "plz send PutAppend command to others, i'm a idle server"
+		return nil
+	}
+	pb.writeCond.L.Lock()
+	for atomic.LoadInt32(&pb.replicating) != 0 {
+		pb.writeCond.Wait()
+	}
+	// log.Printf("[%s] Append %s, value: %s\n", pb.me, args.Key, args.Value)
+	// replicate to backup
+
+	pb.lock.Lock()
+	needReplicate := atomic.LoadInt32(&pb.state) == PRIMARY && pb.view != nil && pb.view.Backup != ""
+	if needReplicate {
+		pb.writeCond.L.Unlock()
+		atomic.StoreInt32(&pb.replicating, 1)
+		defer pb.writeCond.Signal()
+		backup := pb.view.Backup
+		var reply PutAppendReply
+		pb.lock.Unlock()
+		err := pb.replicateCall(backup, "PBServer.PutAppend", args, &reply)
+		atomic.StoreInt32(&pb.replicating, 0)
+		if err != nil {
+			return err
+		}
+		pb.writeCond.L.Lock()
 	} else {
-		// log.Printf("[%s] Append %s, value: %s\n", pb.me, args.Key, args.Value)
-		item, existed := pb.data[args.Key]
-		// avoid duplication
-		if existed {
-			if item.token == args.Token {
-				pb.Unlock()
-				return nil
-			}
-		}
-		value := &Value{
-			token: args.Token,
-		}
-		if args.Operation == PUT_OPERATION || !existed {
-			value.data = args.Value
-			pb.data[args.Key] = value
-		} else {
-			value.data = item.data + args.Value
-			pb.data[args.Key] = value
-		}
-		if pb.replChan != nil {
-			pb.Unlock()
-			doneChan := make(chan bool)
-			pb.replChan <- &RepliOperationArgs{
-				PutAppendArgs: args,
-				doneChan:      doneChan,
-			}
-			<-doneChan
+		pb.lock.Unlock()
+	}
+	defer pb.writeCond.L.Unlock()
+
+	val, existed := pb.data[args.Key]
+	// avoid duplication
+	if existed {
+		token, clientExisted := val.ClientHistory[args.ClientIdentifier]
+		if clientExisted && token == args.Token {
 			return nil
 		}
+	} else {
+		val = &Value{ClientHistory: make(map[int64]int64)}
 	}
-	pb.Unlock()
+	val.ClientHistory[args.ClientIdentifier] = args.Token
+	if args.Operation == PUT_OPERATION || !existed {
+		val.Data = args.Value
+		pb.data[args.Key] = val
+	} else {
+		val.Data = val.Data + args.Value
+		pb.data[args.Key] = val
+	}
 	return nil
-
-	// resultChan := make(chan interface{})
-	// pb.requestChan <- &OperationArgs{
-	//	op:         GET_OPERATION,
-	//	args:       args,
-	//	resultChan: resultChan,
-	// }
-	// *reply = *((<-resultChan).(*PutAppendReply))
-	// return nil
 }
 
-// func (pb *PBServer) Loop() {
-//	tickTick := time.Tick(viewservice.PingInterval)
+func (pb *PBServer) replicateCall(backup string, rpcname string, args interface{}, reply *PutAppendReply) error {
+	for {
+		ok := call(backup, rpcname, args, reply)
+		if ok && reply.Err == "" {
+			break
+		}
+		pb.lock.Lock()
+		changed := atomic.LoadInt32(&pb.state) != PRIMARY || (pb.lastView != nil && pb.lastView.Backup != backup)
+		pb.lock.Unlock()
+		if changed {
+			// log.Println("view has changed, give up replicate call")
+			return fmt.Errorf("give up replicate call %s, view has changed", backup)
+		}
+		reply.Err = ""
+		time.Sleep(viewservice.PingInterval)
+	}
+	return nil
+}
 
-//	for !pb.isdead() {
-//		select {
-//		case request := <-pb.requestChan:
-//			switch request.op {
-//			case GET_OPERATION:
-//				pb.get(request)
-//			case PUT_OPERATION, APPEND_OPERATION:
-//				pb.putAppend(request)
-//			default:
-//				panic(fmt.Sprintf("unknown operation: %v", request.op))
-//			}
-//		case <-tickTick:
-//			pb.tick()
-//		}
-//	}
+func (pb *PBServer) Sync(args *ReplicateArgs, reply *PutAppendReply) error {
+	if atomic.LoadInt32(&pb.state) != BACKUP {
+		reply.Err = Err(fmt.Sprintf("plz send Replicate command to others, i'm %s not a backup server %d", pb.me, atomic.LoadInt32(&pb.state)))
+	} else {
+		pb.writeCond.L.Lock()
+		pb.data = args.Data
+		pb.writeCond.L.Unlock()
+	}
+	return nil
+}
 
-// }
+func (pb *PBServer) sync(view *viewservice.View) bool {
+	data := make(map[string]*Value)
+	pb.writeCond.L.Lock()
+	atomic.StoreInt32(&pb.replicating, 1)
+	for key, value := range pb.data {
+		copiedValue := &Value{
+			Data:          value.Data,
+			ClientHistory: make(map[int64]int64),
+		}
+		for client, token := range value.ClientHistory {
+			copiedValue.ClientHistory[client] = token
+		}
+		data[key] = copiedValue
+	}
+	pb.writeCond.L.Unlock()
 
-// func (pb *PBServer) Get(args *OperationArgs) {
-//	reply := &GetReply{}
-//	getArgs := args.args.(*GetArgs)
-//	if pb.state != PRIMARY {
-//		reply.Err = Err(fmt.Sprintf("plz send get command to primary, my state is %v", pb.state))
-//	} else {
-//		reply.Value = pb.data[getArgs.Key]
-//	}
-// }
+	args := &ReplicateArgs{
+		Data: data,
+	}
+	var reply PutAppendReply
+	err := pb.replicateCall(view.Backup, "PBServer.Sync", args, &reply)
+	atomic.StoreInt32(&pb.replicating, 0)
+	pb.writeCond.Signal()
+	if err == nil {
+		pb.lock.Lock()
+		pb.view = view
+		pb.lock.Unlock()
+		return true
+	}
+	return false
+}
 
-// func (pb *PBServer) putAppend(args *OperationArgs) {
-//	reply := &PutAppendReply{}
-//	putAppendArgs := args.args.(*PutAppendArgs)
-//	if pb.state == IDLE {
-//		reply.Err = "plz send command to others, i'm a idle server"
-//	} else {
-//		if putAppendArgs.Operation == PUT_OPERATION {
-//			pb.data[putAppendArgs.Key] = putAppendArgs.Value
-//		} else {
-//			pb.data[putAppendArgs.Key] += putAppendArgs.Value
-//		}
-//		if pb.replChan != nil {
-//			doneChan := make(chan bool)
-//			pb.replChan <- &RepliOperationArgs{
-//				PutAppendArgs: putAppendArgs,
-//				doneChan:      doneChan,
-//			}
-//			<-doneChan
-//		}
-//	}
-// }
 func (pb *PBServer) clear() {
-	pb.state = IDLE
+	pb.writeCond.L.Lock()
 	pb.data = make(map[string]*Value)
+	pb.writeCond.L.Unlock()
 }
 
 //
@@ -171,66 +182,62 @@ func (pb *PBServer) clear() {
 //   manage transfer of state from primary to new backup.
 //
 func (pb *PBServer) tick() {
-	pb.Lock()
-	defer pb.Unlock()
-	view, err := pb.vs.Ping(pb.view.Viewnum)
+	var viewNum uint = 0
+	atomic.AddInt64(&pb.curTick, 1)
+
+	pb.lock.Lock()
+	if pb.view != nil {
+		viewNum = pb.view.Viewnum
+	}
+	pb.lock.Unlock()
+
+	view, err := pb.vs.Ping(viewNum)
 	if err != nil {
 		log.Printf("ping view server error: %s", err)
-		return
-	}
-	if view.Viewnum == pb.view.Viewnum {
-		return
-	}
-	shouldAck := true
-	if pb.state == IDLE {
-		// idle -> primary, this will only happen at beginning
-		if view.Primary == pb.me {
-			pb.state = PRIMARY
-		} else if view.Backup == pb.me { // idle -> backup
-			pb.state = BACKUP
-		} else { // primary or backup changed, but not me
+		// give up
+		if pb.curTick-pb.lastTick >= viewservice.DeadPings {
+			atomic.StoreInt32(&pb.state, IDLE)
 		}
-	} else if pb.state == BACKUP {
-		// backup -> primary
-		if view.Primary == pb.me {
-			pb.state = PRIMARY
-			pb.backupAddress = view.Backup
-			log.Printf("[%s] become the primary, data size %d\n", pb.me, len(pb.data))
-			pb.replChan = pb.replication.start(pb.data, view.Backup)
-			// we shouldn't ack received view num as backup is still in progress
-			if view.Backup != "" {
-				shouldAck = false
-			}
-		} else if view.Backup != pb.me { // backup -> idle
+		return
+	}
+	atomic.StoreInt64(&pb.lastTick, pb.curTick)
+	pb.lock.Lock()
+	// log.Printf("[%s] tick state %d, view primary %s, backup %s\n", pb.me, atomic.LoadInt32(&pb.state), view.Primary, view.Backup)
+	notChanged := ((pb.view != nil && view.Viewnum == pb.view.Viewnum) || (pb.lastView != nil && view.Viewnum == pb.lastView.Viewnum))
+	pb.lock.Unlock()
+
+	if notChanged {
+		return
+	}
+
+	if view.Primary == pb.me {
+		atomic.StoreInt32(&pb.state, PRIMARY)
+		if view.Backup != "" {
+			go pb.sync(&view)
+		}
+		pb.lock.Lock()
+		pb.lastView = &view
+		// no need to sync
+		if view.Backup == "" {
+			pb.view = &view
+		}
+		pb.lock.Unlock()
+		return
+	} else if view.Backup == pb.me {
+		if atomic.LoadInt32(&pb.state) == PRIMARY {
 			pb.clear()
-		} else { // primary changed, this shouldn't happen!!
-			panic("I was a backup, but primary has changed!")
 		}
+		atomic.StoreInt32(&pb.state, BACKUP)
 	} else {
-		if view.Backup == pb.me { // primary -> backup
-			pb.state = BACKUP
-			pb.replication.stop()
-			pb.replChan = nil
-		} else if view.Primary == pb.me { // backup in progress or backup changed
-			if view.Backup == pb.backupAddress {
-				log.Printf("me %s, backup %s synced %v", pb.me, pb.backupAddress, pb.replication.synced)
-				if !pb.replication.synced {
-					shouldAck = false
-				}
-			} else {
-				pb.backupAddress = view.Backup
-				pb.replChan = pb.replication.start(pb.data, view.Backup)
-				if view.Backup != "" {
-					shouldAck = false
-				}
-			}
-		} else { // primary -> idle
+		if atomic.LoadInt32(&pb.state) != IDLE {
 			pb.clear()
 		}
+		atomic.StoreInt32(&pb.state, IDLE)
 	}
-	if shouldAck {
-		pb.view = view
-	}
+	pb.lock.Lock()
+	pb.view = &view
+	pb.lastView = &view
+	pb.lock.Unlock()
 }
 
 // tell the server to shut itself down.
@@ -263,9 +270,8 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	// Your pb.* initializations here.
-	pb.requestChan = make(chan *OperationArgs)
-	pb.replication = NewReplication(me)
 	pb.data = make(map[string]*Value)
+	pb.writeCond = sync.NewCond(&sync.Mutex{})
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
