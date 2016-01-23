@@ -22,12 +22,6 @@ const (
 	BACKUP
 )
 
-type OperationArgs struct {
-	op         Operation
-	args       interface{}
-	resultChan chan interface{}
-}
-
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
@@ -53,8 +47,10 @@ type GetReply struct {
 	Value string
 }
 
-type ReplicateArgs struct {
+type SyncArgs struct {
 	Data map[string]*Value
 }
+
+type SyncReply PutAppendReply
 
 // Your RPC definitions here.
