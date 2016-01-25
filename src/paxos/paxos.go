@@ -23,14 +23,13 @@ package paxos
 import "net"
 import "net/rpc"
 import "log"
-
+import "time"
 import "os"
 import "syscall"
 import "sync"
 import "sync/atomic"
 import "fmt"
 import "math/rand"
-
 
 // px.Status() return values, indicating
 // whether an agreement has been decided,
@@ -51,10 +50,20 @@ type Paxos struct {
 	unreliable int32 // for testing
 	rpcCount   int32 // for testing
 	peers      []string
-	me         int // index into peers[]
-
+	me         uint32 // index into peers[]
 
 	// Your data here.
+	lock  sync.Mutex
+	items map[int]*logItem
+	// client set done seq
+	doneSeq int64
+	// server max seq
+	maxSeq int64
+	// all peers min done seq
+	peerMinSeq int64
+	// peers sequence lock
+	peersLock   sync.Mutex
+	peersMaxSeq []int64
 }
 
 //
@@ -78,7 +87,7 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 	if err != nil {
 		err1 := err.(*net.OpError)
 		if err1.Err != syscall.ENOENT && err1.Err != syscall.ECONNREFUSED {
-			fmt.Printf("paxos Dial() failed: %v\n", err1)
+			fmt.Printf("paxos Dial() %s failed: %v\n", name, err1)
 		}
 		return false
 	}
@@ -89,10 +98,8 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
 	return false
 }
-
 
 //
 // the application wants paxos to start agreement on
@@ -102,7 +109,239 @@ func call(srv string, name string, args interface{}, reply interface{}) bool {
 // is reached.
 //
 func (px *Paxos) Start(seq int, v interface{}) {
-	// Your code here.
+	go px.propose(seq, v)
+}
+
+func (px *Paxos) decided(seq int) bool {
+	px.lock.Lock()
+	defer px.lock.Unlock()
+	item, existed := px.items[seq]
+	if existed {
+		return item.fate == Decided
+	} else {
+		return false
+	}
+}
+
+func (px *Paxos) createRequestNum(seq int, round uint32) *RequestNumber {
+	return &RequestNumber{
+		Round:    round,
+		ServerId: px.me,
+	}
+}
+
+func (px *Paxos) getRound(seq int) uint32 {
+	px.lock.Lock()
+	defer px.lock.Unlock()
+
+	var round uint32
+	item, existed := px.items[seq]
+	if existed {
+		round = item.prepareNum.Round + 1
+	} else {
+		round = 1
+	}
+	return round
+}
+
+func (px *Paxos) sleep() {
+	time.Sleep(time.Millisecond * (50 + time.Duration(rand.Int()%100)))
+}
+
+func (px *Paxos) maxDoneSeq() int64 {
+	doneSeq := atomic.LoadInt64(&px.doneSeq)
+	maxSeq := atomic.LoadInt64(&px.maxSeq)
+	if doneSeq < maxSeq {
+		return doneSeq
+	} else {
+		return maxSeq
+	}
+}
+
+func (px *Paxos) updateMaxSeq(seq int) {
+	if seq != int(atomic.LoadInt64(&px.maxSeq))+1 {
+		return
+	}
+	px.lock.Lock()
+	defer px.lock.Unlock()
+	var i int
+	for i = seq; ; i++ {
+		item, existed := px.items[i]
+		if !existed || item.fate != Decided {
+			break
+		}
+	}
+	atomic.StoreInt64(&px.maxSeq, int64(i-1))
+}
+
+func (px *Paxos) broadcastPrepare(seq int, num *RequestNumber) (v interface{}, success bool) {
+	majorityNum := len(px.peers)/2 + 1
+	prepareArgs := &PrepareArgs{
+		Seq: seq,
+		Num: num,
+	}
+	var acceptedPrepareNum int
+	var maxAcceptedNum *RequestNumber
+	prepareReplyChan := make(chan *PrepareReply)
+	prepareFunc := func(i int) {
+		var reply PrepareReply
+		if i == int(px.me) {
+			px.Prepare(prepareArgs, &reply)
+			prepareReplyChan <- &reply
+		}
+		if ok := call(px.peers[i], "Paxos.Prepare", prepareArgs, &reply); ok {
+			prepareReplyChan <- &reply
+		} else {
+			prepareReplyChan <- nil
+		}
+
+	}
+	// log.Printf("prepare phase begin\n")
+	for i := range px.peers {
+		go prepareFunc(i)
+
+	}
+	for _ = range px.peers {
+		reply := <-prepareReplyChan
+		if reply != nil {
+			acceptedPrepareNum++
+			if reply.AcceptedValue != nil && (maxAcceptedNum == nil || maxAcceptedNum.Less(reply.AcceptedNumber)) {
+				v = reply.AcceptedValue
+				maxAcceptedNum = reply.AcceptedNumber
+			}
+		}
+	}
+	// log.Printf("prepare phase finish num: %d\n", acceptedPrepareNum)
+	success = acceptedPrepareNum >= majorityNum
+	return
+}
+
+func (px *Paxos) broadcastAccept(seq int, num *RequestNumber, v interface{}) (prepareNum *RequestNumber, success bool) {
+	success = true
+	majorityNum := len(px.peers)/2 + 1
+	prepareNum = num
+	var acceptedAcceptNum int
+	args := &AcceptArgs{
+		Seq:   seq,
+		Num:   num,
+		Value: v,
+	}
+	replyChan := make(chan *AcceptReply)
+
+	acceptFunc := func(i int) {
+		var reply AcceptReply
+		if i == int(px.me) {
+			px.Accept(args, &reply)
+			replyChan <- &reply
+		}
+		if ok := call(px.peers[i], "Paxos.Accept", args, &reply); ok {
+			replyChan <- &reply
+		} else {
+			replyChan <- nil
+		}
+
+	}
+	for i := range px.peers {
+		go acceptFunc(i)
+	}
+
+	for _ = range px.peers {
+		reply := <-replyChan
+		if reply != nil {
+			acceptedAcceptNum++
+			if prepareNum.Less(reply.PrepareNumber) {
+				prepareNum = reply.PrepareNumber
+				success = false
+			}
+		}
+	}
+
+	// log.Printf("prepare phase finish num: %d, success: %v\n", acceptedAcceptNum, success)
+	success = success && (acceptedAcceptNum >= majorityNum)
+	return
+}
+
+func (px *Paxos) broadcastDecided(seq int, num *RequestNumber, v interface{}) {
+	decidedArgs := &DecidedArgs{
+		Seq:    seq,
+		Num:    num,
+		Value:  v,
+		Source: int(px.me),
+		MaxSeq: px.maxDoneSeq(),
+	}
+	var mustDecidedFunc func(i int)
+	mustDecidedFunc = func(i int) {
+		var reply DecidedReply
+		if uint32(i) == px.me {
+			px.Decided(decidedArgs, &reply)
+			return
+		}
+		if ok := call(px.peers[i], "Paxos.Decided", decidedArgs, &reply); ok {
+			return
+		} else {
+			px.sleep()
+			go mustDecidedFunc(i)
+		}
+	}
+	for i := range px.peers {
+		go mustDecidedFunc(i)
+	}
+}
+
+func (px *Paxos) removeDoneItem(seq int64) {
+	for i := px.peerMinSeq; i <= seq; i++ {
+		delete(px.items, int(i))
+	}
+}
+
+func (px *Paxos) updateMinPeerSeq(source int, maxSeq int64) {
+	px.peersLock.Lock()
+	defer px.peersLock.Unlock()
+	if px.peersMaxSeq[source] >= maxSeq {
+		return
+	}
+
+	px.peersMaxSeq[source] = maxSeq
+	peerMinSeq := maxSeq
+	for _, peerMaxSeq := range px.peersMaxSeq {
+		if peerMaxSeq < peerMinSeq {
+			peerMinSeq = peerMaxSeq
+		}
+	}
+	if atomic.LoadInt64(&px.peerMinSeq) < peerMinSeq {
+		px.removeDoneItem(peerMinSeq)
+		px.peerMinSeq = peerMinSeq
+	}
+}
+
+func (px *Paxos) propose(seq int, v interface{}) {
+	round := px.getRound(seq)
+	for !px.isdead() && !px.decided(seq) {
+		num := px.createRequestNum(seq, round)
+		// 2. prepare phase
+		newV, success := px.broadcastPrepare(seq, num)
+		if !success {
+			px.sleep()
+			continue
+		}
+		if newV != nil {
+			v = newV
+		}
+		// 3. accept phase
+		maxPrepareNum, success := px.broadcastAccept(seq, num, v)
+		if !success {
+			round = maxPrepareNum.Round + 1
+			px.sleep()
+			continue
+		}
+		if num.Less(maxPrepareNum) {
+			panic("xx")
+		}
+		px.updateMaxSeq(seq)
+		// 4. decided phase
+		go px.broadcastDecided(seq, num, v)
+		return
+	}
 }
 
 //
@@ -112,7 +351,9 @@ func (px *Paxos) Start(seq int, v interface{}) {
 // see the comments for Min() for more explanation.
 //
 func (px *Paxos) Done(seq int) {
-	// Your code here.
+	if int64(seq) > atomic.LoadInt64(&px.doneSeq) {
+		atomic.StoreInt64(&px.doneSeq, int64(seq))
+	}
 }
 
 //
@@ -121,8 +362,7 @@ func (px *Paxos) Done(seq int) {
 // this peer.
 //
 func (px *Paxos) Max() int {
-	// Your code here.
-	return 0
+	return int(atomic.LoadInt64(&px.maxSeq))
 }
 
 //
@@ -153,9 +393,9 @@ func (px *Paxos) Max() int {
 // missed -- the other peers therefor cannot forget these
 // instances.
 //
+
 func (px *Paxos) Min() int {
-	// You code here.
-	return 0
+	return int(atomic.LoadInt64(&px.peerMinSeq)) + 1
 }
 
 //
@@ -166,11 +406,79 @@ func (px *Paxos) Min() int {
 // it should not contact other Paxos peers.
 //
 func (px *Paxos) Status(seq int) (Fate, interface{}) {
-	// Your code here.
-	return Pending, nil
+	px.lock.Lock()
+	defer px.lock.Unlock()
+
+	if int64(seq) <= atomic.LoadInt64(&px.peerMinSeq) {
+		return Forgotten, nil
+	}
+	if item, existed := px.items[seq]; !existed {
+		return Pending, nil
+	} else {
+		return item.fate, item.value
+	}
+
 }
 
+func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+	px.lock.Lock()
+	defer px.lock.Unlock()
 
+	item, existed := px.items[args.Seq]
+	if !existed {
+		px.items[args.Seq] = &logItem{
+			prepareNum: args.Num,
+		}
+	} else {
+		if item.acceptedNum != nil {
+			reply.AcceptedNumber = item.acceptedNum
+			reply.AcceptedValue = item.value
+		} else {
+			if item.prepareNum.Less(args.Num) {
+				item.prepareNum = args.Num
+			}
+		}
+	}
+	return nil
+}
+
+func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
+	px.lock.Lock()
+	defer px.lock.Unlock()
+	item, existed := px.items[args.Seq]
+	if !existed {
+		px.items[args.Seq] = &logItem{
+			prepareNum:  args.Num,
+			acceptedNum: args.Num,
+			value:       args.Value,
+		}
+	} else {
+		if args.Num.Less(item.prepareNum) {
+			reply.PrepareNumber = item.prepareNum
+		} else {
+			item.prepareNum = args.Num
+			item.acceptedNum = args.Num
+			item.value = args.Value
+		}
+	}
+	return nil
+}
+
+func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
+	log.Printf("[%d] decided, num: %s, seq %d, val: %v\n", px.me, args.Num, args.Seq, args.Value)
+	px.lock.Lock()
+	px.items[args.Seq] = &logItem{
+		prepareNum:  args.Num,
+		acceptedNum: args.Num,
+		value:       args.Value,
+		fate:        Decided,
+	}
+	px.lock.Unlock()
+
+	px.updateMaxSeq(args.Seq)
+	px.updateMinPeerSeq(args.Source, args.MaxSeq)
+	return nil
+}
 
 //
 // tell the peer to shut itself down.
@@ -212,8 +520,15 @@ func (px *Paxos) isunreliable() bool {
 func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 	px := &Paxos{}
 	px.peers = peers
-	px.me = me
-
+	px.me = uint32(me)
+	px.doneSeq = -1
+	px.maxSeq = -1
+	px.peerMinSeq = -1
+	px.items = make(map[int]*logItem)
+	px.peersMaxSeq = make([]int64, len(px.peers))
+	for i, _ := range px.peersMaxSeq {
+		px.peersMaxSeq[i] = -1
+	}
 
 	// Your initialization code here.
 
@@ -267,7 +582,5 @@ func Make(peers []string, me int, rpcs *rpc.Server) *Paxos {
 			}
 		}()
 	}
-
-
 	return px
 }
