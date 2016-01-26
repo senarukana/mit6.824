@@ -123,7 +123,7 @@ func (px *Paxos) decided(seq int) bool {
 	}
 }
 
-func (px *Paxos) createRequestNum(seq int, round uint32) *RequestNumber {
+func (px *Paxos) createRequestNum(round uint32) *RequestNumber {
 	return &RequestNumber{
 		Round:    round,
 		ServerId: px.me,
@@ -188,6 +188,7 @@ func (px *Paxos) broadcastPrepare(seq int, num *RequestNumber) (v interface{}, s
 		if i == int(px.me) {
 			px.Prepare(prepareArgs, &reply)
 			prepareReplyChan <- &reply
+			return
 		}
 		if ok := call(px.peers[i], "Paxos.Prepare", prepareArgs, &reply); ok {
 			prepareReplyChan <- &reply
@@ -233,6 +234,7 @@ func (px *Paxos) broadcastAccept(seq int, num *RequestNumber, v interface{}) (pr
 		if i == int(px.me) {
 			px.Accept(args, &reply)
 			replyChan <- &reply
+			return
 		}
 		if ok := call(px.peers[i], "Paxos.Accept", args, &reply); ok {
 			replyChan <- &reply
@@ -317,7 +319,7 @@ func (px *Paxos) updateMinPeerSeq(source int, maxSeq int64) {
 func (px *Paxos) propose(seq int, v interface{}) {
 	round := px.getRound(seq)
 	for !px.isdead() && !px.decided(seq) {
-		num := px.createRequestNum(seq, round)
+		num := px.createRequestNum(round)
 		// 2. prepare phase
 		newV, success := px.broadcastPrepare(seq, num)
 		if !success {
@@ -333,9 +335,6 @@ func (px *Paxos) propose(seq int, v interface{}) {
 			round = maxPrepareNum.Round + 1
 			px.sleep()
 			continue
-		}
-		if num.Less(maxPrepareNum) {
-			panic("xx")
 		}
 		px.updateMaxSeq(seq)
 		// 4. decided phase
@@ -428,6 +427,7 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 	if !existed {
 		px.items[args.Seq] = &logItem{
 			prepareNum: args.Num,
+			fate:       Pending,
 		}
 	} else {
 		if item.acceptedNum != nil {
@@ -436,6 +436,7 @@ func (px *Paxos) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 		} else {
 			if item.prepareNum.Less(args.Num) {
 				item.prepareNum = args.Num
+				item.fate = Pending
 			}
 		}
 	}
@@ -451,6 +452,7 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 			prepareNum:  args.Num,
 			acceptedNum: args.Num,
 			value:       args.Value,
+			fate:        Pending,
 		}
 	} else {
 		if args.Num.Less(item.prepareNum) {
@@ -465,7 +467,7 @@ func (px *Paxos) Accept(args *AcceptArgs, reply *AcceptReply) error {
 }
 
 func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
-	log.Printf("[%d] decided, num: %s, seq %d, val: %v\n", px.me, args.Num, args.Seq, args.Value)
+	// log.Printf("[%d] decided, num: %s, seq %d, val: %v\n", px.me, args.Num, args.Seq, args.Value)
 	px.lock.Lock()
 	px.items[args.Seq] = &logItem{
 		prepareNum:  args.Num,
