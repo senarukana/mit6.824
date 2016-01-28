@@ -9,8 +9,7 @@ import "time"
 import "fmt"
 
 type Clerk struct {
-	servers    []string
-	identifier int64
+	servers []string
 }
 
 func nrand() int64 {
@@ -23,7 +22,6 @@ func nrand() int64 {
 func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	ck.identifier = nrand()
 	return ck
 }
 
@@ -68,14 +66,15 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
 	args := &GetArgs{
-		Key: key,
+		Key:   key,
+		Token: nrand(),
 	}
 	var reply GetReply
 
 	for {
 		server := ck.servers[rand.Int()%len(ck.servers)]
 		ok := call(server, "KVPaxos.Get", args, &reply)
-		if ok && reply.Err == "" {
+		if ok && (reply.Err == "" || reply.Err == ErrNoKey) {
 			break
 		}
 		reply.Err = ""
@@ -92,6 +91,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key:   key,
 		Value: value,
 		Op:    op,
+		Token: nrand(),
 	}
 	for {
 		var reply PutAppendReply

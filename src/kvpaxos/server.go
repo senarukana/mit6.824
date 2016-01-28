@@ -26,11 +26,14 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Id           int64
+	Token        int64
 	Operation    Operation
-	Key          string
-	Value        string
+	Args         interface{}
 	responseChan chan interface{}
+}
+
+func (op *Op) String() string {
+	return fmt.Sprintf("Op: %s, Args: %s", op.Operation, op.Args)
 }
 
 type KVPaxos struct {
@@ -42,6 +45,7 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 	// Your definitions here.
 	data      map[string]string
+	requests  map[int64]bool
 	opChan    chan *Op
 	closeChan chan bool
 	curSeq    int
@@ -51,27 +55,39 @@ func (kv *KVPaxos) loop() {
 	for !kv.isdead() {
 		select {
 		case op := <-kv.opChan:
-			kv.handleOP(op)
+			kv.handle(op)
 		case <-kv.closeChan:
 			return
 		}
 	}
 }
 
-func (kv *KVPaxos) handleOP(op *Op) {
+func (kv *KVPaxos) handle(op *Op) {
 	var complete bool
+	if _, existed := kv.requests[op.Token]; existed {
+		if op.Operation == GET_OPERATION {
+			val, existed := kv.data[op.Args.(*GetArgs).Key]
+			if existed {
+				op.responseChan <- val
+			} else {
+				op.responseChan <- ErrNoKey
+			}
+		} else {
+			op.responseChan <- nil
+		}
+		return
+	}
 	for !kv.isdead() && !complete {
-		kv.px.Start(kv.curSeq, *op)
-		response := kv.waitSeqDecided(kv.curSeq).(Op)
-		complete = response.Id == op.Id
-		kv.handle(&response, op.responseChan, complete)
+		kv.px.Start(kv.curSeq, op)
+		response := kv.waitSeqDecided(kv.curSeq).(*Op)
+		complete = response.Token == op.Token
+		kv.handleResponse(response, op.responseChan, complete)
+		kv.requests[response.Token] = true
 		kv.curSeq++
 	}
-	log.Printf("handle op key %s complete\n", op.Key)
 }
 
 func (kv *KVPaxos) waitSeqDecided(seq int) interface{} {
-	log.Printf("wait seq %d decided\n", seq)
 	to := 10 * time.Millisecond
 	for {
 		fate, v := kv.px.Status(seq)
@@ -86,34 +102,45 @@ func (kv *KVPaxos) waitSeqDecided(seq int) interface{} {
 
 }
 
-func (kv *KVPaxos) handle(op *Op, responseChan chan interface{}, complete bool) {
-	if op.Operation == GET_OPERATION {
+func (kv *KVPaxos) handleResponse(response *Op, responseChan chan interface{}, complete bool) {
+	if response.Operation == GET_OPERATION {
+		// log.Printf("[%d] seq %d, op %s\n", kv.me, kv.curSeq, response.Args.(*GetArgs))
 		if complete {
-			if v, existed := kv.data[op.Key]; existed {
+			args := response.Args.(*GetArgs)
+			if v, existed := kv.data[args.Key]; existed {
 				responseChan <- v
 			} else {
 				responseChan <- ErrNoKey
 			}
 		}
 	} else {
-		if op.Operation == PUT_OPERATION {
-			kv.data[op.Key] = op.Value
-		} else {
-			kv.data[op.Key] += op.Value
-		}
-		log.Printf("put key %s, val %s, data %s\n", op.Key, op.Value, kv.data[op.Key])
+		kv.handlePutAppend(response)
 		if complete {
 			responseChan <- nil
 		}
 	}
+	kv.px.Done(kv.curSeq)
+}
 
+func (kv *KVPaxos) handlePutAppend(op *Op) {
+	args := op.Args.(*PutAppendArgs)
+	_, existed := kv.data[args.Key]
+	if !existed {
+		kv.data[args.Key] = args.Value
+	} else {
+		if op.Operation == PUT_OPERATION {
+			kv.data[args.Key] = args.Value
+		} else {
+			kv.data[args.Key] += args.Value
+		}
+	}
 }
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	op := &Op{
-		Id:           nrand(),
-		Key:          args.Key,
+		Token:        args.Token,
 		Operation:    GET_OPERATION,
+		Args:         args,
 		responseChan: make(chan interface{}),
 	}
 	kv.opChan <- op
@@ -134,10 +161,9 @@ func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		operation = APPEND_OPERATION
 	}
 	op := &Op{
-		Id:           nrand(),
-		Key:          args.Key,
-		Value:        args.Value,
+		Token:        args.Token,
 		Operation:    operation,
+		Args:         args,
 		responseChan: make(chan interface{}),
 	}
 	kv.opChan <- op
@@ -182,11 +208,14 @@ func (kv *KVPaxos) isunreliable() bool {
 func StartServer(servers []string, me int) *KVPaxos {
 	// call gob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
+	gob.Register(&Op{})
+	gob.Register(&PutAppendArgs{})
+	gob.Register(&GetArgs{})
 
 	kv := new(KVPaxos)
 	kv.me = me
 	kv.data = make(map[string]string)
+	kv.requests = make(map[int64]bool)
 	kv.opChan = make(chan *Op)
 	kv.closeChan = make(chan bool)
 	go kv.loop()

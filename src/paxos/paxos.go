@@ -258,7 +258,7 @@ func (px *Paxos) broadcastAccept(seq int, num *RequestNumber, v interface{}) (pr
 		}
 	}
 
-	// log.Printf("prepare phase finish num: %d, success: %v\n", acceptedAcceptNum, success)
+	// log.Printf("prepare phase finish num: %d/%d, success: %v\n", acceptedAcceptNum, len(px.peers), success)
 	success = success && (acceptedAcceptNum >= majorityNum)
 	return
 }
