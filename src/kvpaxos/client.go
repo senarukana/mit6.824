@@ -1,19 +1,21 @@
 package kvpaxos
 
 import "net/rpc"
-import "crypto/rand"
+import crand "crypto/rand"
 import "math/big"
+import "math/rand"
+import "time"
 
 import "fmt"
 
 type Clerk struct {
-	servers []string
-	// You will have to modify this struct.
+	servers    []string
+	identifier int64
 }
 
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
+	bigx, _ := crand.Int(crand.Reader, max)
 	x := bigx.Int64()
 	return x
 }
@@ -21,7 +23,7 @@ func nrand() int64 {
 func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.identifier = nrand()
 	return ck
 }
 
@@ -65,15 +67,41 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 //
 func (ck *Clerk) Get(key string) string {
-	// You will have to modify this function.
-	return ""
+	args := &GetArgs{
+		Key: key,
+	}
+	var reply GetReply
+
+	for {
+		server := ck.servers[rand.Int()%len(ck.servers)]
+		ok := call(server, "KVPaxos.Get", args, &reply)
+		if ok && reply.Err == "" {
+			break
+		}
+		reply.Err = ""
+		time.Sleep(time.Millisecond * 100)
+	}
+	return reply.Value
 }
 
 //
 // shared by Put and Append.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	args := &PutAppendArgs{
+		Key:   key,
+		Value: value,
+		Op:    op,
+	}
+	for {
+		var reply PutAppendReply
+		server := ck.servers[rand.Int()%len(ck.servers)]
+		ok := call(server, "KVPaxos.PutAppend", args, &reply)
+		if ok && reply.Err == "" {
+			return
+		}
+		time.Sleep(time.Millisecond * 100)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

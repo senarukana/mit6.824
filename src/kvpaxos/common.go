@@ -6,6 +6,14 @@ const (
 )
 
 type Err string
+type Operation int
+
+const (
+	PUT_OPERATION Operation = iota
+	APPEND_OPERATION
+	REPLICATE_OPERATION
+	GET_OPERATION
+)
 
 // Put or Append
 type PutAppendArgs struct {
