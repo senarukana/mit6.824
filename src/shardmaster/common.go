@@ -22,6 +22,15 @@ package shardmaster
 
 const NShards = 10
 
+type Operation string
+
+const (
+	JOIN_OPERATION  Operation = "JOIN"
+	LEAVE_OPERATION           = "LEAVE"
+	MOVE_OPERATION            = "MOVE"
+	QUERY_OPERATION           = "QUERY"
+)
+
 type Config struct {
 	Num    int                // config number
 	Shards [NShards]int64     // shard -> gid
