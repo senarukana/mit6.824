@@ -14,7 +14,6 @@ import "encoding/gob"
 import "math/rand"
 import "shardmaster"
 
-
 const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -24,11 +23,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
+	Id           int64
+	Operation    Operation
+	Args         interface{}
+	responseChan chan interface{}
 }
-
 
 type ShardKV struct {
 	mu         sync.Mutex
@@ -42,8 +42,133 @@ type ShardKV struct {
 	gid int64 // my replica group ID
 
 	// Your definitions here.
+	data        map[int]map[string]string
+	requests    map[int64]bool
+	config      *shardmaster.Config
+	ownedShards map[int]bool
+	opChan      chan *Op
+	closeChan   chan bool
+	curSeq      int
 }
 
+func (kv *ShardKV) loop() {
+	for !kv.isdead() {
+		select {
+		case op := <-kv.opChan:
+			kv.handle(op)
+		case <-kv.closeChan:
+			return
+		}
+	}
+}
+
+func (kv *ShardKV) handle(op *Op) {
+	var complete bool
+	if _, existed := kv.requests[op.Id]; existed {
+		if op.Operation == GET_OPERATION {
+			kv.handleGet(op.Args.(*GetArgs), op.responseChan)
+		} else {
+			op.responseChan <- nil
+		}
+		return
+	}
+	for !kv.isdead() && !complete {
+		kv.px.Start(kv.curSeq, op)
+		response := kv.waitSeqDecided(kv.curSeq).(*Op)
+		complete = response.Id == op.Id
+		kv.handleResponse(response, op.responseChan, complete)
+		kv.requests[response.Id] = true
+		kv.px.Done(kv.curSeq)
+		kv.curSeq++
+	}
+}
+
+func (kv *ShardKV) waitSeqDecided(seq int) interface{} {
+	to := 10 * time.Millisecond
+	for {
+		fate, v := kv.px.Status(seq)
+		if fate == paxos.Decided {
+			return v
+		}
+		time.Sleep(to)
+		if to < 10*time.Second {
+			to *= 2
+		}
+	}
+
+}
+
+func (kv *ShardKV) handleResponse(op *Op, responseChan chan interface{}, complete bool) {
+	switch op.Operation {
+	case GET_OPERATION:
+		if complete {
+			kv.handleGet(op.Args.(*GetArgs), responseChan)
+		}
+		return
+	case PUT_APPEND_OPERATION:
+		kv.handlePutAppend(op.Args.(*PutAppendArgs), responseChan, complete)
+	case SHARD_SYNC_OPERATION:
+		kv.handleShardSync(op.Args.(*ShardSyncArgs), responseChan, complete)
+	case RECONFIG_OPERATION:
+		// sm.handleMove(op.Args.(*MoveArgs))
+	}
+}
+
+func (kv *ShardKV) handleGet(args *GetArgs, responseChan chan interface{}) {
+	shardId := key2shard(args.Key)
+	if !kv.ownedShards[shardId] {
+		responseChan <- ErrWrongGroup
+	}
+	shard := kv.data[shardId]
+	val, existed := shard[args.Key]
+	if existed {
+		responseChan <- val
+	} else {
+		responseChan <- ErrNoKey
+	}
+}
+
+func (kv *ShardKV) handlePutAppend(args *PutAppendArgs, responseChan chan interface{}, complete bool) {
+	shardId := key2shard(args.Key)
+	if !kv.ownedShards[shardId] {
+		if complete {
+			responseChan <- ErrWrongGroup
+		}
+		return
+	}
+	shard := kv.data[shardId]
+	val, existed := shard[args.Key]
+	if !existed {
+		shard[args.Key] = args.Value
+	} else {
+		if args.Op == "PUT" {
+			shard[args.Key] = args.Value
+		} else {
+			shard[args.Key] = val + args.Value
+		}
+	}
+	if complete {
+		responseChan <- nil
+	}
+}
+
+func (kv *ShardKV) handleShardSync(args *ShardSyncArgs, responseChan chan interface{}, complete bool) {
+	if !kv.ownedShards[args.ShardId] {
+		if complete {
+			responseChan <- ErrWrongGroup
+		}
+	}
+	shard := kv.data[args.ShardId]
+	copiedShard := make(map[string]string)
+	for key, val := range shard {
+		copiedShard[key] = val
+	}
+	responseChan <- copiedShard
+}
+
+func (kv *ShardKV) handleReconfig(args *ReconfigArgs, responseChan chan interface{}, complete bool) {
+
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
@@ -114,7 +239,6 @@ func StartServer(gid int64, shardmasters []string,
 	rpcs.Register(kv)
 
 	kv.px = paxos.Make(servers, me, rpcs)
-
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])

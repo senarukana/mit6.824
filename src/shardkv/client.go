@@ -16,10 +16,15 @@ type Clerk struct {
 }
 
 func nrand() int64 {
-	max := big.NewInt(int64(1) << 62)
-	bigx, _ := rand.Int(rand.Reader, max)
-	x := bigx.Int64()
-	return x
+	for {
+		max := big.NewInt(int64(1) << 62)
+		bigx, _ := rand.Int(rand.Reader, max)
+		x := bigx.Int64()
+		if x < 1000000 { // 0 - 1000000 is reserved id for configuration change
+			continue
+		}
+		return x
+	}
 }
 
 func MakeClerk(shardmasters []string) *Clerk {
@@ -87,19 +92,20 @@ func (ck *Clerk) Get(key string) string {
 	defer ck.mu.Unlock()
 
 	// You'll have to modify Get().
-
 	for {
 		shard := key2shard(key)
 
 		gid := ck.config.Shards[shard]
 
 		servers, ok := ck.config.Groups[gid]
+		id := nrand()
 
 		if ok {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
 				args := &GetArgs{}
 				args.Key = key
+				args.Id = id
 				var reply GetReply
 				ok := call(srv, "ShardKV.Get", args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
@@ -124,13 +130,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	defer ck.mu.Unlock()
 
 	// You'll have to modify PutAppend().
-
 	for {
 		shard := key2shard(key)
 
 		gid := ck.config.Shards[shard]
 
 		servers, ok := ck.config.Groups[gid]
+		id := nrand()
 
 		if ok {
 			// try each server in the shard's replication group.
@@ -139,6 +145,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				args.Key = key
 				args.Value = value
 				args.Op = op
+				args.Id = id
 				var reply PutAppendReply
 				ok := call(srv, "ShardKV.PutAppend", args, &reply)
 				if ok && reply.Err == OK {

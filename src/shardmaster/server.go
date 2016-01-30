@@ -255,6 +255,7 @@ func (sm *ShardMaster) handleJoin(args *JoinArgs) {
 					break
 				}
 			}
+			// counters is sorted by desc, shards is negative
 			gc.shards++
 			counters.Push(gc)
 			desired--
