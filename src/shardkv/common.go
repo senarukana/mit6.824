@@ -12,16 +12,17 @@ import "shardmaster"
 //
 
 const (
-	OK            = "OK"
-	ErrNoKey      = "ErrNoKey"
-	ErrWrongGroup = "ErrWrongGroup"
+	OK                = "OK"
+	ErrNoKey      Err = "ErrNoKey"
+	ErrWrongGroup Err = "ErrWrongGroup"
 )
 
 type Err string
 type Operation string
 
 const (
-	PUT_APPEND_OPERATION Operation = "PUT_APPEND"
+	PUT_OPERATION        Operation = "PUT"
+	APPEND_OPERATION               = "APPEND"
 	GET_OPERATION                  = "GET"
 	SHARD_SYNC_OPERATION           = "SHARD_SYNC"
 	RECONFIG_OPERATION             = "RECONFIG"
@@ -53,11 +54,9 @@ type GetReply struct {
 }
 
 type ReconfigArgs struct {
+	Id     int
 	Config *shardmaster.Config
-	Id     int64
 }
-
-type ReconfigReply struct{}
 
 type ShardSyncArgs struct {
 	ShardId int
@@ -66,5 +65,5 @@ type ShardSyncArgs struct {
 
 type ShardSyncReply struct {
 	Err   Err
-	Shard map[string]string
+	Shard *Shard
 }

@@ -30,7 +30,7 @@ func nrand() int64 {
 func MakeClerk(shardmasters []string) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(shardmasters)
-	// You'll have to modify MakeClerk.
+	ck.config = ck.sm.Query(-1)
 	return ck
 }
 
@@ -94,7 +94,6 @@ func (ck *Clerk) Get(key string) string {
 	// You'll have to modify Get().
 	for {
 		shard := key2shard(key)
-
 		gid := ck.config.Shards[shard]
 
 		servers, ok := ck.config.Groups[gid]
@@ -103,12 +102,14 @@ func (ck *Clerk) Get(key string) string {
 		if ok {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
+				DPrintf("CLIENT GET: %s\n", key)
 				args := &GetArgs{}
 				args.Key = key
 				args.Id = id
 				var reply GetReply
 				ok := call(srv, "ShardKV.Get", args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+				DPrintf("CLIENT GET COMPLETE: %v,%s\n", ok, reply.Err)
+				if ok && (reply.Err == "" || reply.Err == ErrNoKey) {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -148,7 +149,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				args.Id = id
 				var reply PutAppendReply
 				ok := call(srv, "ShardKV.PutAppend", args, &reply)
-				if ok && reply.Err == OK {
+				DPrintf("CLIENT Put: %v,%s\n", ok, reply.Err)
+				if ok && reply.Err == "" {
 					return
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -167,6 +169,40 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
+
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) ShardSync(shard int, gid int64) *Shard {
+	for {
+		servers, ok := ck.config.Groups[gid]
+		id := nrand()
+
+		if ok {
+			// try each server in the shard's replication group.
+			for _, srv := range servers {
+				args := &ShardSyncArgs{
+					Id:      id,
+					ShardId: shard,
+				}
+				var reply ShardSyncReply
+				ok := call(srv, "ShardKV.ShardSync", args, &reply)
+				DPrintf("CLIENT Shard %d: %v,%s@@@@@@@@@@@@@@@@@\n", shard, ok, reply.Err)
+				if ok && reply.Err == "" {
+					DPrintf("CLIENT Shard %d: %v,%s COOOOOMMMM @@@@@@@@@@@@@@@@@\n", shard, ok, reply.Err)
+					return reply.Shard
+				}
+				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		// ask master for a new configuration.
+		ck.config = ck.sm.Query(-1)
+	}
+
 }
